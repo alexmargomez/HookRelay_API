@@ -1,0 +1,39 @@
+services:
+  db:
+    image: mariadb:11
+    container_name: hookrelay_mariadb
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MARIADB_DATABASE: "${MARIADB_DATABASE:-hookrelay_db}"
+      MARIADB_USER: "${MARIADB_USER:-hookrelay_user}"
+      MARIADB_PASSWORD: "${MARIADB_PASSWORD:-hookrelay_pass_2026}"
+      MARIADB_ROOT_PASSWORD: "${MARIADB_ROOT_PASSWORD:-hookrelay_root_2026}"
+    ports:
+      - "${DB_EXTERNAL_PORT:-3313}:3306"
+    volumes:
+      - hookrelay_db_data:/var/lib/mysql
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hookrelay_backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: "${PORT:-8088}"
+      DB_HOST: "${DB_HOST:-db}"
+      DB_PORT: "${DB_PORT:-3306}"
+      MARIADB_DATABASE: "${MARIADB_DATABASE:-hookrelay_db}"
+      MARIADB_USER: "${MARIADB_USER:-hookrelay_user}"
+      MARIADB_PASSWORD: "${MARIADB_PASSWORD:-hookrelay_pass_2026}"
+    ports:
+      - "${PORT:-8088}:${PORT:-8088}"
+    depends_on:
+      - db
+
+volumes:
+  hookrelay_db_data:
