@@ -2,6 +2,7 @@ import { EndpointCircuitBreaker } from '../src/domain/state/circuit-breaker.stat
 import { ExponentialFullJitterStrategy } from '../src/domain/strategy/backoff.strategy';
 import { HmacSignerService } from '../src/infrastructure/crypto/hmac-signer.service';
 import { WebhookRelayUseCase } from '../src/application/use-cases/webhook-relay.use-case';
+import { InMemoryOutboxRepository } from '../src/infrastructure/persistence/in-memory-outbox.repository';
 
 describe('HookRelay API — Circuit Breaker, Exponential Backoff, HMAC-SHA256 & Dead-Letter Queue', () => {
   it('State Pattern (Circuit Breaker): transiciona de CLOSED -> OPEN tras fallos consecutivos y pasa a HALF_OPEN tras el cooldown', () => {
@@ -85,5 +86,34 @@ describe('HookRelay API — Circuit Breaker, Exponential Backoff, HMAC-SHA256 & 
     const replayed = useCase.replayFromDlq(failed.event.id, 200);
     expect(replayed.event.status).toBe('DELIVERED');
     expect(replayed.circuitState.state).toBe('CLOSED');
+  });
+
+  it('InMemoryOutboxRepository: respeta maxCapacity aplicando evicción FIFO/LRU sin fugas de memoria', () => {
+    const repo = new InMemoryOutboxRepository(2);
+    const useCase = new WebhookRelayUseCase(undefined, repo);
+
+    const e1 = useCase.dispatch({
+      idempotencyKey: 'key_1',
+      eventType: 'ev.1',
+      targetUrl: 'https://a.co/hook',
+      payload: {},
+    });
+    useCase.dispatch({
+      idempotencyKey: 'key_2',
+      eventType: 'ev.2',
+      targetUrl: 'https://a.co/hook',
+      payload: {},
+    });
+    useCase.dispatch({
+      idempotencyKey: 'key_3',
+      eventType: 'ev.3',
+      targetUrl: 'https://a.co/hook',
+      payload: {},
+    });
+
+    expect(repo.count()).toBe(2);
+    expect(repo.findById(e1.event.id)).toBeUndefined();
+    expect(repo.findByIdempotencyKey('key_1')).toBeUndefined();
+    expect(repo.findByIdempotencyKey('key_3')).toBeDefined();
   });
 });

@@ -1,10 +1,12 @@
 import crypto from 'crypto';
+import { WebhookOutboxRepositoryPort } from '../../domain/ports/webhook-outbox-repository.port';
 import {
   CircuitBreakerSnapshot,
   EndpointCircuitBreaker,
 } from '../../domain/state/circuit-breaker.state';
 import { resolveBackoffStrategy } from '../../domain/strategy/backoff.strategy';
 import { HmacSignerService, hmacSignerService } from '../../infrastructure/crypto/hmac-signer.service';
+import { InMemoryOutboxRepository } from '../../infrastructure/persistence/in-memory-outbox.repository';
 
 export interface DeliveryAttemptLog {
   attemptNumber: number;
@@ -44,17 +46,18 @@ export interface DispatchWebhookInput {
 
 /**
  * Use Case + Command Pattern + Idempotent Receiver + Dead-Letter Queue (DLQ) —
- * Orquesta el despacho confiable de Webhooks con firma HMAC-SHA256, Circuit Breaker por host
- * y reintentos con Exponential Backoff + Jitter.
+ * Orquesta el despacho confiable de Webhooks desacoplado de la persistencia
+ * mediante el puerto de salida WebhookOutboxRepositoryPort.
  */
 export class WebhookRelayUseCase {
-  private events = new Map<string, OutboxWebhookEvent>();
-  private idempotencyIndex = new Map<string, string>();
   private circuitBreakers = new Map<string, EndpointCircuitBreaker>();
   private readonly defaultSecret =
     process.env.HOOKRELAY_DEFAULT_SECRET || 'whsec_hookrelay_hmac_sha256_2026';
 
-  constructor(private readonly signer: HmacSignerService = hmacSignerService) {}
+  constructor(
+    private readonly signer: HmacSignerService = hmacSignerService,
+    private readonly outboxRepository: WebhookOutboxRepositoryPort = new InMemoryOutboxRepository()
+  ) {}
 
   dispatch(input: DispatchWebhookInput): {
     deduplicated: boolean;
@@ -68,10 +71,9 @@ export class WebhookRelayUseCase {
     const idemKey =
       (input.idempotencyKey || '').trim() || `idem_${crypto.randomBytes(8).toString('hex')}`;
 
-    // 1. Idempotent Receiver Pattern: evitar despachos duplicados
-    const existingId = this.idempotencyIndex.get(idemKey);
-    if (existingId && this.events.has(existingId)) {
-      const existingEv = this.events.get(existingId)!;
+    // 1. Idempotent Receiver Pattern: consultar por el puerto de salida
+    const existingEv = this.outboxRepository.findByIdempotencyKey(idemKey);
+    if (existingEv) {
       const breaker = this.getOrCreateBreaker(existingEv.targetHost);
       return {
         deduplicated: true,
@@ -112,8 +114,7 @@ export class WebhookRelayUseCase {
       input.simulateTargetStatus || 200
     );
 
-    this.events.set(id, event);
-    this.idempotencyIndex.set(idemKey, id);
+    this.outboxRepository.save(event);
 
     return {
       deduplicated: false,
@@ -130,16 +131,16 @@ export class WebhookRelayUseCase {
     event: OutboxWebhookEvent;
     circuitState: CircuitBreakerSnapshot;
   } {
-    const event = this.events.get(eventId);
+    const event = this.outboxRepository.findById(eventId);
     if (!event) {
       throw new Error(`No existe ningún evento con ID ${eventId}`);
     }
 
     const breaker = this.getOrCreateBreaker(event.targetHost);
-    // En replay manual restablecemos el circuito a HALF_OPEN si estaba OPEN
     breaker.recordSuccess();
 
     this.executeDeliveryCommand(event, breaker, 'EXPONENTIAL', simulateTargetStatus);
+    this.outboxRepository.save(event);
     return {
       replayed: true,
       event,
@@ -154,7 +155,7 @@ export class WebhookRelayUseCase {
     circuitBreakers: CircuitBreakerSnapshot[];
     events: OutboxWebhookEvent[];
   } {
-    const all = Array.from(this.events.values()).reverse();
+    const all = this.outboxRepository.findAllNewestFirst();
     const breakers = Array.from(this.circuitBreakers.values()).map((b) => b.snapshot());
     return {
       totalEvents: all.length,
@@ -205,7 +206,6 @@ export class WebhookRelayUseCase {
       return;
     }
 
-    // Simular cadena de reintentos con Exponential Backoff + Jitter hasta agotar maxRetries
     for (let i = 1; i <= event.maxRetries; i++) {
       event.attemptsCount += 1;
       breaker.recordFailure();
