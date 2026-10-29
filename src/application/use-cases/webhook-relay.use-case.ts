@@ -1,11 +1,17 @@
 import crypto from 'crypto';
+import { WebhookDispatcherPort } from '../../domain/ports/webhook-dispatcher.port';
 import { WebhookOutboxRepositoryPort } from '../../domain/ports/webhook-outbox-repository.port';
 import {
   CircuitBreakerSnapshot,
   EndpointCircuitBreaker,
 } from '../../domain/state/circuit-breaker.state';
 import { resolveBackoffStrategy } from '../../domain/strategy/backoff.strategy';
+import { SafeWebhookTargetVO } from '../../domain/value-objects/safe-webhook-target.vo';
 import { HmacSignerService, hmacSignerService } from '../../infrastructure/crypto/hmac-signer.service';
+import {
+  FetchWebhookDispatcherAdapter,
+  fetchWebhookDispatcher,
+} from '../../infrastructure/http/fetch-webhook-dispatcher.adapter';
 import { InMemoryOutboxRepository } from '../../infrastructure/persistence/in-memory-outbox.repository';
 
 export interface DeliveryAttemptLog {
@@ -46,8 +52,8 @@ export interface DispatchWebhookInput {
 
 /**
  * Use Case + Command Pattern + Idempotent Receiver + Dead-Letter Queue (DLQ) —
- * Orquesta el despacho confiable de Webhooks desacoplado de la persistencia
- * mediante el puerto de salida WebhookOutboxRepositoryPort.
+ * Orquesta el despacho confiable de Webhooks con validación Anti-SSRF (SafeWebhookTargetVO),
+ * puerto de despacho HTTP (WebhookDispatcherPort) y persistencia desacoplada (WebhookOutboxRepositoryPort).
  */
 export class WebhookRelayUseCase {
   private circuitBreakers = new Map<string, EndpointCircuitBreaker>();
@@ -56,7 +62,8 @@ export class WebhookRelayUseCase {
 
   constructor(
     private readonly signer: HmacSignerService = hmacSignerService,
-    private readonly outboxRepository: WebhookOutboxRepositoryPort = new InMemoryOutboxRepository()
+    private readonly outboxRepository: WebhookOutboxRepositoryPort = new InMemoryOutboxRepository(),
+    private readonly dispatcher: WebhookDispatcherPort = fetchWebhookDispatcher
   ) {}
 
   dispatch(input: DispatchWebhookInput): {
@@ -67,6 +74,8 @@ export class WebhookRelayUseCase {
     if (!input.targetUrl || !input.eventType) {
       throw new Error('targetUrl y eventType son obligatorios');
     }
+
+    const safeTarget = new SafeWebhookTargetVO(input.targetUrl);
 
     const idemKey =
       (input.idempotencyKey || '').trim() || `idem_${crypto.randomBytes(8).toString('hex')}`;
@@ -82,7 +91,7 @@ export class WebhookRelayUseCase {
       };
     }
 
-    const targetHost = this.extractHost(input.targetUrl);
+    const targetHost = safeTarget.host;
     const breaker = this.getOrCreateBreaker(targetHost);
     const secret = (input.secret || '').trim() || this.defaultSecret;
     const payloadJson = JSON.stringify(input.payload || {});
@@ -96,7 +105,7 @@ export class WebhookRelayUseCase {
       id,
       idempotencyKey: idemKey,
       eventType: input.eventType,
-      targetUrl: input.targetUrl,
+      targetUrl: safeTarget.url,
       targetHost,
       payload: input.payload || {},
       hmacHeader,
@@ -111,7 +120,8 @@ export class WebhookRelayUseCase {
       event,
       breaker,
       input.backoffStrategy,
-      input.simulateTargetStatus || 200
+      input.simulateTargetStatus || 200,
+      payloadJson
     );
 
     this.outboxRepository.save(event);
@@ -139,7 +149,13 @@ export class WebhookRelayUseCase {
     const breaker = this.getOrCreateBreaker(event.targetHost);
     breaker.recordSuccess();
 
-    this.executeDeliveryCommand(event, breaker, 'EXPONENTIAL', simulateTargetStatus);
+    this.executeDeliveryCommand(
+      event,
+      breaker,
+      'EXPONENTIAL',
+      simulateTargetStatus,
+      JSON.stringify(event.payload || {})
+    );
     this.outboxRepository.save(event);
     return {
       replayed: true,
@@ -170,7 +186,8 @@ export class WebhookRelayUseCase {
     event: OutboxWebhookEvent,
     breaker: EndpointCircuitBreaker,
     strategyMode: string | undefined,
-    simulatedStatus: number
+    simulatedStatus: number,
+    payloadJson: string
   ): void {
     const strategy = resolveBackoffStrategy(strategyMode);
     const gate = breaker.canPass();
@@ -190,18 +207,27 @@ export class WebhookRelayUseCase {
       return;
     }
 
-    if (simulatedStatus >= 200 && simulatedStatus < 300) {
+    const result = this.dispatcher.sendSyncOrSimulated({
+      targetUrl: event.targetUrl,
+      eventType: event.eventType,
+      idempotencyKey: event.idempotencyKey,
+      hmacHeader: event.hmacHeader,
+      payloadJson,
+      simulateTargetStatus: simulatedStatus,
+    });
+
+    if (result.ok) {
       event.attemptsCount += 1;
       event.status = 'DELIVERED';
       breaker.recordSuccess();
       event.attempts.push({
         attemptNumber: event.attemptsCount,
         executedAt: new Date().toISOString(),
-        httpStatus: simulatedStatus,
-        latencyMs: 12.4,
+        httpStatus: result.httpStatus,
+        latencyMs: result.latencyMs,
         outcome: 'DELIVERED_2XX',
         nextRetryDelayMs: null,
-        detail: `Entregado exitosamente a ${event.targetUrl} con firma ${event.hmacHeader.slice(0, 28)}...`,
+        detail: result.detail,
       });
       return;
     }
@@ -214,13 +240,13 @@ export class WebhookRelayUseCase {
       event.attempts.push({
         attemptNumber: event.attemptsCount,
         executedAt: new Date().toISOString(),
-        httpStatus: simulatedStatus,
-        latencyMs: 145.0,
+        httpStatus: result.httpStatus,
+        latencyMs: result.latencyMs,
         outcome: 'FAILED_5XX_OR_TIMEOUT',
         nextRetryDelayMs: delayMs,
         detail: isLast
           ? `Reintentos agotados (${event.maxRetries}/${event.maxRetries}). Movido a Dead-Letter Queue (DLQ).`
-          : `Fallo HTTP ${simulatedStatus}. Próximo reintento programado en ${delayMs}ms (${strategy.name}).`,
+          : `Fallo HTTP ${result.httpStatus}. Próximo reintento programado en ${delayMs}ms (${strategy.name}).`,
       });
     }
     event.status = 'DEAD_LETTER_QUEUE';
@@ -234,14 +260,10 @@ export class WebhookRelayUseCase {
     }
     return b;
   }
-
-  private extractHost(rawUrl: string): string {
-    try {
-      return new URL(rawUrl).host;
-    } catch {
-      return rawUrl.replace(/^https?:\/\//, '').split('/')[0] || 'unknown-host';
-    }
-  }
 }
 
-export const webhookRelayUseCase = new WebhookRelayUseCase();
+export const webhookRelayUseCase = new WebhookRelayUseCase(
+  hmacSignerService,
+  new InMemoryOutboxRepository(5000),
+  new FetchWebhookDispatcherAdapter()
+);

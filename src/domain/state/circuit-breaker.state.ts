@@ -1,6 +1,7 @@
 /**
  * State Pattern — Máquina de Estados Finita para el Cortacircuitos (Circuit Breaker)
  * por dominio/endpoint destino: CLOSED -> OPEN -> HALF_OPEN -> CLOSED.
+ * Incluye semáforo probeInFlight para evitar Thundering Herd durante HALF_OPEN.
  */
 export type CircuitStateName = 'CLOSED' | 'OPEN' | 'HALF_OPEN';
 
@@ -12,12 +13,14 @@ export interface CircuitBreakerSnapshot {
   cooldownMs: number;
   openedAtMs: number | null;
   remainingCooldownMs: number;
+  probeInFlight: boolean;
 }
 
 export class EndpointCircuitBreaker {
   private state: CircuitStateName = 'CLOSED';
   private consecutiveFailures = 0;
   private openedAtMs: number | null = null;
+  private probeInFlight = false;
 
   constructor(
     public readonly targetHost: string,
@@ -34,6 +37,7 @@ export class EndpointCircuitBreaker {
       const elapsed = this.openedAtMs ? nowMs - this.openedAtMs : this.cooldownMs;
       if (elapsed >= this.cooldownMs) {
         this.state = 'HALF_OPEN';
+        this.probeInFlight = true;
         return { allowed: true, state: 'HALF_OPEN' };
       }
       const remSec = Math.ceil((this.cooldownMs - elapsed) / 1000);
@@ -44,7 +48,16 @@ export class EndpointCircuitBreaker {
       };
     }
 
-    // En HALF_OPEN se permite pasar 1 intento de prueba
+    // En HALF_OPEN solo se permite 1 sonda activa simultánea (Thundering Herd Protection)
+    if (this.probeInFlight) {
+      return {
+        allowed: false,
+        state: 'HALF_OPEN',
+        reason: `Circuit Breaker HALF_OPEN para ${this.targetHost} (sonda de prueba en vuelo, rechazando tráfico concurrente)`,
+      };
+    }
+
+    this.probeInFlight = true;
     return { allowed: true, state: 'HALF_OPEN' };
   }
 
@@ -52,10 +65,12 @@ export class EndpointCircuitBreaker {
     this.consecutiveFailures = 0;
     this.state = 'CLOSED';
     this.openedAtMs = null;
+    this.probeInFlight = false;
   }
 
   recordFailure(nowMs = Date.now()): void {
     this.consecutiveFailures += 1;
+    this.probeInFlight = false;
     if (this.state === 'HALF_OPEN' || this.consecutiveFailures >= this.failureThreshold) {
       this.state = 'OPEN';
       this.openedAtMs = nowMs;
@@ -63,7 +78,6 @@ export class EndpointCircuitBreaker {
   }
 
   snapshot(nowMs = Date.now()): CircuitBreakerSnapshot {
-    // Actualizar transición automática si el cooldown ya expiró
     if (this.state === 'OPEN' && this.openedAtMs && nowMs - this.openedAtMs >= this.cooldownMs) {
       this.state = 'HALF_OPEN';
     }
@@ -80,6 +94,7 @@ export class EndpointCircuitBreaker {
       cooldownMs: this.cooldownMs,
       openedAtMs: this.openedAtMs,
       remainingCooldownMs: remaining,
+      probeInFlight: this.probeInFlight,
     };
   }
 }

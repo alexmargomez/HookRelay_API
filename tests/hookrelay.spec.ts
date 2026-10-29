@@ -1,11 +1,12 @@
 import { EndpointCircuitBreaker } from '../src/domain/state/circuit-breaker.state';
 import { ExponentialFullJitterStrategy } from '../src/domain/strategy/backoff.strategy';
+import { SafeWebhookTargetVO } from '../src/domain/value-objects/safe-webhook-target.vo';
 import { HmacSignerService } from '../src/infrastructure/crypto/hmac-signer.service';
 import { WebhookRelayUseCase } from '../src/application/use-cases/webhook-relay.use-case';
 import { InMemoryOutboxRepository } from '../src/infrastructure/persistence/in-memory-outbox.repository';
 
 describe('HookRelay API — Circuit Breaker, Exponential Backoff, HMAC-SHA256 & Dead-Letter Queue', () => {
-  it('State Pattern (Circuit Breaker): transiciona de CLOSED -> OPEN tras fallos consecutivos y pasa a HALF_OPEN tras el cooldown', () => {
+  it('State Pattern (Circuit Breaker): transiciona de CLOSED -> OPEN -> HALF_OPEN y bloquea Thundering Herd durante la sonda', () => {
     const breaker = new EndpointCircuitBreaker('api.cliente-caido.com', 3, 10000);
     expect(breaker.canPass(1000).state).toBe('CLOSED');
 
@@ -19,14 +20,28 @@ describe('HookRelay API — Circuit Breaker, Exponential Backoff, HMAC-SHA256 & 
     expect(blocked.allowed).toBe(false);
     expect(blocked.state).toBe('OPEN');
 
-    // Después de los 10,000ms de cooldown transiciona a HALF_OPEN
-    const halfOpen = breaker.canPass(13500);
-    expect(halfOpen.allowed).toBe(true);
-    expect(halfOpen.state).toBe('HALF_OPEN');
+    // Después de los 10,000ms de cooldown transiciona a HALF_OPEN y permite 1 sola sonda
+    const halfOpenProbe = breaker.canPass(13500);
+    expect(halfOpenProbe.allowed).toBe(true);
+    expect(halfOpenProbe.state).toBe('HALF_OPEN');
 
-    // Al registrar éxito en HALF_OPEN vuelve a CLOSED
+    // Una segunda petición concurrente mientras la sonda sigue en vuelo debe ser rechazada (Thundering Herd Protection)
+    const concurrentDuringProbe = breaker.canPass(13501);
+    expect(concurrentDuringProbe.allowed).toBe(false);
+    expect(concurrentDuringProbe.state).toBe('HALF_OPEN');
+
+    // Al registrar éxito en HALF_OPEN vuelve a CLOSED y libera el candado
     breaker.recordSuccess();
     expect(breaker.snapshot().state).toBe('CLOSED');
+    expect(breaker.canPass(13600).allowed).toBe(true);
+  });
+
+  it('SafeWebhookTargetVO: bloquea ataques SSRF hacia localhost, redes RFC 1918 y metadatos Cloud 169.254.169.254', () => {
+    expect(new SafeWebhookTargetVO('https://erp.empresa.co/webhooks').host).toBe('erp.empresa.co');
+    expect(() => new SafeWebhookTargetVO('http://127.0.0.1:3306/internal')).toThrow(/SSRF bloqueado/);
+    expect(() => new SafeWebhookTargetVO('http://localhost:8080/admin')).toThrow(/SSRF bloqueado/);
+    expect(() => new SafeWebhookTargetVO('http://169.254.169.254/latest/meta-data/')).toThrow(/SSRF bloqueado/);
+    expect(() => new SafeWebhookTargetVO('http://192.168.1.50/router')).toThrow(/SSRF bloqueado/);
   });
 
   it('Strategy Pattern (Exponential Backoff): duplica exponencialmente el tiempo de espera entre intentos', () => {
@@ -88,32 +103,33 @@ describe('HookRelay API — Circuit Breaker, Exponential Backoff, HMAC-SHA256 & 
     expect(replayed.circuitState.state).toBe('CLOSED');
   });
 
-  it('InMemoryOutboxRepository: respeta maxCapacity aplicando evicción FIFO/LRU sin fugas de memoria', () => {
+  it('InMemoryOutboxRepository: respeta maxCapacity y preserva eventos DLQ desalojando primero los DELIVERED', () => {
     const repo = new InMemoryOutboxRepository(2);
     const useCase = new WebhookRelayUseCase(undefined, repo);
 
-    const e1 = useCase.dispatch({
-      idempotencyKey: 'key_1',
-      eventType: 'ev.1',
+    const dlqEv = useCase.dispatch({
+      idempotencyKey: 'key_dlq',
+      eventType: 'ev.dlq',
+      targetUrl: 'https://caido.co/hook',
+      simulateTargetStatus: 503,
+      payload: {},
+    });
+    const deliveredEv = useCase.dispatch({
+      idempotencyKey: 'key_ok_1',
+      eventType: 'ev.ok1',
       targetUrl: 'https://a.co/hook',
       payload: {},
     });
     useCase.dispatch({
-      idempotencyKey: 'key_2',
-      eventType: 'ev.2',
-      targetUrl: 'https://a.co/hook',
-      payload: {},
-    });
-    useCase.dispatch({
-      idempotencyKey: 'key_3',
-      eventType: 'ev.3',
+      idempotencyKey: 'key_ok_2',
+      eventType: 'ev.ok2',
       targetUrl: 'https://a.co/hook',
       payload: {},
     });
 
     expect(repo.count()).toBe(2);
-    expect(repo.findById(e1.event.id)).toBeUndefined();
-    expect(repo.findByIdempotencyKey('key_1')).toBeUndefined();
-    expect(repo.findByIdempotencyKey('key_3')).toBeDefined();
+    // El evento en DLQ debe haberse preservado y el evento DELIVERED más antiguo desalojado
+    expect(repo.findById(dlqEv.event.id)).toBeDefined();
+    expect(repo.findById(deliveredEv.event.id)).toBeUndefined();
   });
 });

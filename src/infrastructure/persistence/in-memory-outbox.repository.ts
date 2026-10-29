@@ -2,9 +2,9 @@ import { OutboxWebhookEvent } from '../../application/use-cases/webhook-relay.us
 import { WebhookOutboxRepositoryPort } from '../../domain/ports/webhook-outbox-repository.port';
 
 /**
- * Adaptador de Persistencia con Evicción LRU Acotada —
+ * Adaptador de Persistencia con Evicción Inteligente Priorizada —
  * Implementa WebhookOutboxRepositoryPort protegiendo el heap de Node.js
- * contra fugas de memoria ante millones de eventos.
+ * y priorizando la preservación de eventos en DEAD_LETTER_QUEUE frente a eventos ya entregados.
  */
 export class InMemoryOutboxRepository implements WebhookOutboxRepositoryPort {
   private readonly events = new Map<string, OutboxWebhookEvent>();
@@ -14,13 +14,22 @@ export class InMemoryOutboxRepository implements WebhookOutboxRepositoryPort {
 
   save(event: OutboxWebhookEvent): void {
     if (!this.events.has(event.id) && this.events.size >= this.maxCapacity) {
-      const oldestKey = this.events.keys().next().value;
-      if (oldestKey) {
-        const oldestEvent = this.events.get(oldestKey);
-        if (oldestEvent) {
-          this.idempotencyIndex.delete(oldestEvent.idempotencyKey);
+      let victimKey: string | undefined;
+      for (const [k, ev] of this.events.entries()) {
+        if (ev.status === 'DELIVERED') {
+          victimKey = k;
+          break;
         }
-        this.events.delete(oldestKey);
+      }
+      if (!victimKey) {
+        victimKey = this.events.keys().next().value;
+      }
+      if (victimKey) {
+        const victimEvent = this.events.get(victimKey);
+        if (victimEvent) {
+          this.idempotencyIndex.delete(victimEvent.idempotencyKey);
+        }
+        this.events.delete(victimKey);
       }
     }
     this.events.set(event.id, event);
