@@ -30,7 +30,9 @@ export class WebhookHttpController {
     app.post('/api/v1/webhooks/dispatch', async (req, reply) => {
       try {
         const body = (req.body || {}) as DispatchWebhookInput;
-        const res = this.relayUseCase.dispatch(body);
+        const res = body.liveHttp
+          ? await this.relayUseCase.dispatchAsync(body)
+          : this.relayUseCase.dispatch(body);
         return reply.code(res.deduplicated ? 200 : 202).send(res);
       } catch (err: any) {
         return reply.code(400).send({ error: err.message });

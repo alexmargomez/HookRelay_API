@@ -15,8 +15,8 @@ export class SafeWebhookTargetVO {
     /\.internal$/i,
     /(^|\.)(localtest\.me|lvh\.me|nip\.io|sslip\.io|xip\.io)$/i,
     /^\d+$/, // IP en entero decimal puro (ej. 2130706433)
-    /^0x[0-9a-f]+$/i, // IP en hexadecimal
-    /^0\d+\./, // Notación octal (ej. 0177.0.0.1)
+    /(^|\.)0x[0-9a-f]+/i, // IP o segmento en hexadecimal (ej. 0x7f000001 o 0x7f.0.0.1)
+    /(^|\.)0\d+\./, // Notación octal (ej. 0177.0.0.1)
     /^127\.\d+\.\d+\.\d+$/,
     /^10\.\d+\.\d+\.\d+$/,
     /^192\.168\.\d+\.\d+$/,
