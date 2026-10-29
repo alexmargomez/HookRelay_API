@@ -1,15 +1,25 @@
+import dns from 'dns';
+import net from 'net';
 import {
   WebhookDispatcherPort,
   WebhookDispatchRequest,
   WebhookDispatchResult,
 } from '../../domain/ports/webhook-dispatcher.port';
+import { SafeWebhookTargetVO } from '../../domain/value-objects/safe-webhook-target.vo';
 
 /**
  * Adaptador HTTP para despacho de Webhooks con soporte dual:
- * - Despacho HTTP real mediante Node 20 fetch() + AbortSignal.timeout()
+ * - Despacho HTTP real mediante Node 20 fetch() + AbortSignal.timeout() + verificación DNS Anti-Rebinding.
  * - Modo determinista de simulación cuando simulateTargetStatus es provisto.
  */
 export class FetchWebhookDispatcherAdapter implements WebhookDispatcherPort {
+  constructor(
+    private readonly dnsLookupFn: (
+      hostname: string
+    ) => Promise<Array<{ address: string; family: number }>> = (hostname) =>
+      dns.promises.lookup(hostname, { all: true })
+  ) {}
+
   async send(request: WebhookDispatchRequest): Promise<WebhookDispatchResult> {
     if (typeof request.simulateTargetStatus === 'number') {
       return this.sendSyncOrSimulated(request);
@@ -17,8 +27,27 @@ export class FetchWebhookDispatcherAdapter implements WebhookDispatcherPort {
 
     const start = performance.now();
     try {
-      const response = await fetch(request.targetUrl, {
+      const safeTarget = new SafeWebhookTargetVO(request.targetUrl);
+      const cleanHost = safeTarget.hostname.replace(/^\[|\]$/g, '');
+
+      // Prevención de DNS Rebinding: resolver las IPs del dominio y verificar que ninguna sea privada/loopback
+      if (net.isIP(cleanHost) === 0) {
+        const resolvedRecords = await this.dnsLookupFn(cleanHost);
+        if (!resolvedRecords || resolvedRecords.length === 0) {
+          throw new Error(`No se pudo resolver DNS para ${cleanHost}`);
+        }
+        for (const rec of resolvedRecords) {
+          if (SafeWebhookTargetVO.isBlockedAddressOrHost(rec.address)) {
+            throw new Error(
+              `SSRF / DNS Rebinding bloqueado: '${cleanHost}' resolvió a la IP interna prohibida '${rec.address}'`
+            );
+          }
+        }
+      }
+
+      const response = await fetch(safeTarget.url, {
         method: 'POST',
+        redirect: 'error',
         headers: {
           'Content-Type': 'application/json',
           'X-HookRelay-Event': request.eventType,
@@ -45,7 +74,7 @@ export class FetchWebhookDispatcherAdapter implements WebhookDispatcherPort {
         httpStatus: 504,
         latencyMs,
         ok: false,
-        detail: `Error de red o timeout hacia ${request.targetUrl}: ${err?.message || 'Timeout'}`,
+        detail: `Error de red o bloqueo de seguridad hacia ${request.targetUrl}: ${err?.message || 'Timeout'}`,
       };
     }
   }

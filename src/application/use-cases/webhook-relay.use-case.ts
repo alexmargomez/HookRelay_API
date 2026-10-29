@@ -252,9 +252,17 @@ export class WebhookRelayUseCase {
     event.status = 'DEAD_LETTER_QUEUE';
   }
 
+  private static readonly MAX_TRACKED_BREAKERS = 2000;
+
   private getOrCreateBreaker(host: string): EndpointCircuitBreaker {
     let b = this.circuitBreakers.get(host);
     if (!b) {
+      if (this.circuitBreakers.size >= WebhookRelayUseCase.MAX_TRACKED_BREAKERS) {
+        const oldestHost = this.circuitBreakers.keys().next().value;
+        if (oldestHost !== undefined) {
+          this.circuitBreakers.delete(oldestHost);
+        }
+      }
       b = new EndpointCircuitBreaker(host, 3, 30000);
       this.circuitBreakers.set(host, b);
     }

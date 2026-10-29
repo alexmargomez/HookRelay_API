@@ -36,12 +36,15 @@ describe('HookRelay API — Circuit Breaker, Exponential Backoff, HMAC-SHA256 & 
     expect(breaker.canPass(13600).allowed).toBe(true);
   });
 
-  it('SafeWebhookTargetVO: bloquea ataques SSRF hacia localhost, redes RFC 1918 y metadatos Cloud 169.254.169.254', () => {
+  it('SafeWebhookTargetVO: bloquea ataques SSRF hacia localhost, redes RFC 1918, IPv6 mapeado en hex y metadatos Cloud 169.254.169.254', () => {
     expect(new SafeWebhookTargetVO('https://erp.empresa.co/webhooks').host).toBe('erp.empresa.co');
     expect(() => new SafeWebhookTargetVO('http://127.0.0.1:3306/internal')).toThrow(/SSRF bloqueado/);
     expect(() => new SafeWebhookTargetVO('http://localhost:8080/admin')).toThrow(/SSRF bloqueado/);
     expect(() => new SafeWebhookTargetVO('http://169.254.169.254/latest/meta-data/')).toThrow(/SSRF bloqueado/);
     expect(() => new SafeWebhookTargetVO('http://192.168.1.50/router')).toThrow(/SSRF bloqueado/);
+    expect(() => new SafeWebhookTargetVO('http://[::ffff:127.0.0.1]/secret')).toThrow(/SSRF bloqueado/);
+    expect(() => new SafeWebhookTargetVO('http://[::ffff:169.254.169.254]/meta')).toThrow(/SSRF bloqueado/);
+    expect(() => new SafeWebhookTargetVO('http://localtest.me/internal')).toThrow(/SSRF bloqueado/);
   });
 
   it('Strategy Pattern (Exponential Backoff): duplica exponencialmente el tiempo de espera entre intentos', () => {
@@ -131,5 +134,26 @@ describe('HookRelay API — Circuit Breaker, Exponential Backoff, HMAC-SHA256 & 
     // El evento en DLQ debe haberse preservado y el evento DELIVERED más antiguo desalojado
     expect(repo.findById(dlqEv.event.id)).toBeDefined();
     expect(repo.findById(deliveredEv.event.id)).toBeUndefined();
+  });
+
+  it('FetchWebhookDispatcherAdapter: bloquea ataques de DNS Rebinding cuando un dominio público resuelve a 127.0.0.1', async () => {
+    const { FetchWebhookDispatcherAdapter } = await import(
+      '../src/infrastructure/http/fetch-webhook-dispatcher.adapter'
+    );
+    const adapter = new FetchWebhookDispatcherAdapter(async () => [
+      { address: '127.0.0.1', family: 4 },
+    ]);
+
+    const res = await adapter.send({
+      targetUrl: 'https://atacante-rebinding.com/hook',
+      eventType: 'invoice.paid',
+      idempotencyKey: 'idem_dns_1',
+      hmacHeader: 't=1,v1=abc',
+      payloadJson: '{}',
+    });
+
+    expect(res.ok).toBe(false);
+    expect(res.httpStatus).toBe(504);
+    expect(res.detail).toMatch(/DNS Rebinding bloqueado/);
   });
 });
